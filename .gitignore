@@ -1,0 +1,98 @@
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[oc]
+*.pyo
+*.pyd
+*.so
+build/
+dist/
+wheels/
+*.egg-info/
+*.egg
+.eggs/
+MANIFEST
+
+# ── Virtual environments ──────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+.python-version
+
+# ── uv / pip ──────────────────────────────────────────────────────────────────
+uv.lock
+pip-wheel-metadata/
+
+# ── Data & datasets ───────────────────────────────────────────────────────────
+data/
+datasets/
+*.JPEG
+*.jpeg
+*.jpg
+*.png
+*.bmp
+*.tiff
+
+# ── Model weights & checkpoints ───────────────────────────────────────────────
+*.pth
+*.pt
+*.bin
+*.safetensors
+*.onnx
+*.ckpt
+models/
+checkpoints/
+results/
+
+# ── Experiment outputs ────────────────────────────────────────────────────────
+*.csv
+*.json
+*.jsonl
+*.npz
+*.npy
+*.pkl
+*.pickle
+
+# ── Logs ─────────────────────────────────────────────────────────────────────
+*.log
+logs/
+runs/
+wandb/
+mlruns/
+.neptune/
+
+# ── Jupyter / IPython ─────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb
+
+# ── Coverage & testing ────────────────────────────────────────────────────────
+.coverage
+.coverage.*
+htmlcov/
+.pytest_cache/
+.tox/
+
+# ── MyPy / type checkers ──────────────────────────────────────────────────────
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pytype/
+
+# ── IDEs & editors ────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.ropeproject/
+
+# ── OS cruft ──────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── Temp / scratch ────────────────────────────────────────────────────────────
+tmp/
+scratch/
+*.tmp
+*.bak
