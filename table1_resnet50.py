@@ -1,75 +1,310 @@
 """
-Replication of Table 1 from:
-  "M4: A Unified XAI Benchmark for Faithfulness Evaluation of Feature
-   Attribution Methods across Metrics, Modalities and Models"
-  NeurIPS 2023 D&B Track.
+Table 1 Replication — M4 XAI Benchmark (NeurIPS 2023)
+=======================================================
+Target: ResNet-50, ImageNet-val 5000-image subset
 
-Target: ResNet-50, ImageNet validation, 5 methods × 5 metrics.
+EXACT metric formulas (from medical_image_example.ipynb in the repo):
 
-Metrics implemented here:
-  - MoRF  : Most Relevant First AUC (Eq. 1)
-  - LeRF  : Least Relevant First AUC (Eq. 2)
-  - ABPC  : MoRF - LeRF (Eq. 3)
+  MoRF  = mean_images( mean_k( probas[0] - MoRF_probas[k] ) for k=0..K )
+         = mean_images( probas[0] - mean(MoRF_probas) )
+         Note: probas[0] = original unmasked image probability
+         ↑ higher = more faithful (important pixels removed → big prob drop)
 
-Attribution methods:
-  - constant  : constant-zero saliency (baseline)
-  - random    : random N(0,1) saliency
-  - gradcam   : Grad-CAM (layer4 of ResNet-50)
-  - ig        : Integrated Gradients (captum)
-  - sg        : SmoothGrad (captum)
+  ABPC  = mean_images( mean_k( LeRF_probas[k] - MoRF_probas[k] ) )
+         ↑ higher = more faithful (area between perturbation curves)
 
-Dataset: ImageNet validation images with labels.
-Paper uses 5 images per class × 1000 classes = 5000 images.
-Here we work with whatever images are available in --data_dir.
+  LeRF (not reported in paper) analogous to MoRF with least-relevant-first order.
 
-Usage:
-    python table1_resnet50.py \\
-        --data_dir /path/to/imagenet/val \\
-        --label_file /path/to/ILSVRC2012_validation_ground_truth.txt \\
-        --num_samples 500 \\
-        --patch_size 16 \\
-        --n_steps 50 \\
-        --output_csv results_table1.csv
+Perturbation implementation (from InterpretDL perturbation.py):
+  • Images stored as uint8 [N,H,W,C] in [0,255] RGB
+  • Masking baseline: mx = (127, 127, 127) in [0,255] space
+  • Then normalised: /255, -mean, /std
+  • Percentile schedule (n=20 steps, cumulative):
+        q  = 100/20 = 5
+        qs = [95, 90, 85, …, 5, 0]      (19 down to 0, i.e. q*(i-1) descending)
+  • MoRF: iterate qs in order, mask pixels > p  (cumulative)
+  • LeRF: iterate qs REVERSED [0, 5, …, 95], mask pixels < p (cumulative)
+  • class-of-interest = argmax(model(original_image))
+
+Attribution params matched to paper (from run_expl.sh):
+  SmoothGrad: noise_amount=0.1, n_samples=100
+  IntGrad:    num_random_trials=10, baselines=random, steps=50
+  GradCAM:    target_layer_name=layer4.2.relu  (= ResNet-50 layer4[-1])
+
+Paper Table-1 reference (ResNet-50):
+  Method       MoRF↑   ABPC↑
+  Constant     0.000   0.000
+  Random-16    0.596   0.007
+  Random       0.599   0.008
+  GradCAM      0.628   0.424
+  IG           0.709   0.377
+  SG           0.701   0.369
 """
 
 import argparse
 import csv
 import os
 import random
-import sys
-from typing import Optional
+import time
+from pathlib import Path
 
+import cv2
 import numpy as np
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 from PIL import Image
 from torchvision import models, transforms
-from captum.attr import IntegratedGradients, NoiseTunnel
+from torchvision.datasets import ImageFolder
 
-# ── Optional: pytorch-grad-cam ──────────────────────────────────────────────
 try:
-    from pytorch_grad_cam import GradCAM as PytorchGradCAM
+    from captum.attr import IntegratedGradients, NoiseTunnel, Saliency
+    HAS_CAPTUM = True
+except ImportError:
+    HAS_CAPTUM = False
+    print("[warn] captum not found — ig/sg will be skipped")
+
+try:
+    from pytorch_grad_cam import GradCAM as _GradCAM
     from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget
     HAS_GRADCAM = True
 except ImportError:
     HAS_GRADCAM = False
-    print("[warn] pytorch-grad-cam not installed; GradCAM will fall back to "
-          "gradient × input. Install with: pip install grad-cam", flush=True)
+    print("[warn] pytorch-grad-cam not found — gradcam will use grad×input fallback")
 
-# ── Preprocessing & model ────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Constants
+# ─────────────────────────────────────────────────────────────────────────────
+IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+IMAGENET_STD  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+MX_UINT8      = 127.0    # grey masking baseline in [0,255] space
+N_STEPS       = 20
 
-IMAGENET_MEAN = [0.485, 0.456, 0.406]
-IMAGENET_STD  = [0.229, 0.224, 0.225]
 
-def build_preprocess():
-    return transforms.Compose([
-        transforms.Resize(256),
-        transforms.CenterCrop(224),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
-    ])
+# ─────────────────────────────────────────────────────────────────────────────
+# Image I/O — exactly matching InterpretDL's pipeline
+# ─────────────────────────────────────────────────────────────────────────────
 
+def _resize_short(img_hwc: np.ndarray, target: int) -> np.ndarray:
+    """Resize so the shorter side = target, keeping aspect ratio."""
+    h, w = img_hwc.shape[:2]
+    if h < w:
+        new_h, new_w = target, max(1, int(w * target / h))
+    else:
+        new_h, new_w = max(1, int(h * target / w)), target
+    return np.array(Image.fromarray(img_hwc).resize((new_w, new_h), Image.BILINEAR))
+
+
+def _center_crop(img_hwc: np.ndarray, size: int) -> np.ndarray:
+    h, w = img_hwc.shape[:2]
+    top  = (h - size) // 2
+    left = (w - size) // 2
+    return img_hwc[top:top+size, left:left+size]
+
+
+def read_image_uint8(img_path: str, resize_to: int = 224, crop_to: int = 224) -> np.ndarray:
+    """Returns (H, W, 3) uint8 numpy RGB — matches InterpretDL's read_image()."""
+    with open(img_path, "rb") as f:
+        img = Image.open(f).convert("RGB")
+    img = np.array(img, dtype=np.uint8)
+    img = _resize_short(img, resize_to)
+    img = _center_crop(img, crop_to)
+    return img  # (224, 224, 3) uint8
+
+
+def preprocess_image(imgs_nhwc: np.ndarray) -> np.ndarray:
+    """
+    Exactly InterpretDL's preprocess_image():
+      input : (N, H, W, 3)  uint8 or float  — RGB
+      output: (N, 3, H, W)  float32 normalised
+    """
+    imgs = imgs_nhwc.astype(np.float32) / 255.0
+    imgs = imgs.transpose(0, 3, 1, 2)           # (N, 3, H, W)
+    imgs -= IMAGENET_MEAN.reshape(3, 1, 1)
+    imgs /= IMAGENET_STD.reshape(3, 1, 1)
+    return imgs
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Perturbation sample generation — exact port of InterpretDL's
+# generate_samples_array() in perturbation.py
+# ─────────────────────────────────────────────────────────────────────────────
+
+def generate_morf_lerf_images(
+    img_nhwc: np.ndarray,     # (1, H, W, 3) uint8  — as returned by read_image
+    attr_map: np.ndarray,     # (H, W) float32 — higher = more important
+    n_steps: int = N_STEPS,
+) -> tuple:
+    """
+    Returns:
+        morf_nhwc : (n_steps+1, H, W, 3) uint8  — step 0 = original
+        lerf_nhwc : (n_steps+1, H, W, 3) uint8
+
+    Exactly mirrors InterpretDL generate_samples_array():
+        q  = 100 / n_steps
+        qs = [q*(n-1), q*(n-2), ..., q*0]  →  [95, 90, ..., 5, 0]
+        percentiles = np.percentile(attr_map, qs)
+
+        MoRF: for p in percentiles       → cumulative mask pixels > p
+        LeRF: for p in percentiles[::-1] → cumulative mask pixels < p
+    """
+    q    = 100.0 / n_steps
+    qs   = [q * (n_steps - 1 - i) for i in range(n_steps)]  # [95, 90, ..., 0]
+    thrs = np.percentile(attr_map, qs)                        # shape (n_steps,)
+
+    img_chw = img_nhwc[0]   # (H, W, 3) uint8 — InterpretDL stores as (H,W,C)
+
+    # InterpretDL assigns mx to [channel] indices, img stored as (H,W,C) here
+    def _mask_hwc(base_hwc: np.ndarray, mask_hw: np.ndarray) -> np.ndarray:
+        out = base_hwc.copy()
+        out[mask_hw] = MX_UINT8   # broadcast over channels for matching rows
+        return out
+
+    # ── MoRF (cumulative, most-relevant-first) ────────────────────────────
+    morf_list = [img_chw.copy()]
+    fudged = img_chw.copy()
+    for p in thrs:            # descending: 95 → 0
+        fudged = fudged.copy()
+        mask = attr_map > p   # (H, W) bool
+        fudged[mask] = MX_UINT8
+        morf_list.append(fudged)
+
+    # ── LeRF (cumulative, least-relevant-first) ───────────────────────────
+    lerf_list = [img_chw.copy()]
+    fudged = img_chw.copy()
+    for p in thrs[::-1]:      # ascending: 0 → 95
+        fudged = fudged.copy()
+        mask = attr_map < p   # (H, W) bool
+        fudged[mask] = MX_UINT8
+        lerf_list.append(fudged)
+
+    morf_nhwc = np.stack(morf_list, axis=0)   # (K+1, H, W, 3)
+    lerf_nhwc = np.stack(lerf_list, axis=0)
+    return morf_nhwc, lerf_nhwc
+
+
+@torch.no_grad()
+def run_model_on_batch(model, imgs_nhwc: np.ndarray, device, bs: int = 8) -> np.ndarray:
+    """
+    Runs model on (N, H, W, 3) uint8 numpy batch.
+    Returns (N, n_classes) softmax probabilities.
+    """
+    data = preprocess_image(imgs_nhwc)   # (N, 3, H, W) float32
+    all_probs = []
+    for start in range(0, len(data), bs):
+        chunk = torch.tensor(data[start:start+bs], dtype=torch.float32, device=device)
+        p = F.softmax(model(chunk), dim=1).cpu().numpy()
+        all_probs.append(p)
+        del chunk
+    return np.concatenate(all_probs)   # (N, n_classes)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Attribution methods  →  (H, W) float32 saliency map
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _agg_to_2d(attr_tensor: torch.Tensor, hw: tuple) -> np.ndarray:
+    """
+    attr_tensor: (1, C, H', W') — aggregate |attr| over channels → resize to hw.
+    Matches InterpretDL: explanation = np.abs(explanation).sum(0) then cv2.resize.
+    """
+    a = attr_tensor.detach().cpu().numpy().squeeze(0)  # (C, H', W')
+    a = np.abs(a).sum(axis=0)                           # (H', W')
+    if a.shape != hw:
+        a = cv2.resize(a, (hw[1], hw[0]), interpolation=cv2.INTER_LINEAR)
+    return a.astype(np.float32)
+
+
+def attr_constant(img_hwc, inp_norm, pred_cls, model, device, **kw) -> np.ndarray:
+    """All-ones saliency → ties everywhere → no masking order → MoRF = 0."""
+    h, w = img_hwc.shape[:2]
+    return np.ones((h, w), dtype=np.float32)
+
+
+def attr_random(img_hwc, inp_norm, pred_cls, model, device, rng=None, **kw) -> np.ndarray:
+    """Pixel-level uniform random saliency."""
+    h, w = img_hwc.shape[:2]
+    rng = rng if rng is not None else np.random.default_rng()
+    return rng.uniform(0.0, 1.0, size=(h, w)).astype(np.float32)
+
+
+def attr_random_16(img_hwc, inp_norm, pred_cls, model, device, rng=None, **kw) -> np.ndarray:
+    """Patch-level (16×16) random saliency — 'Random-16' in Table 1."""
+    h, w = img_hwc.shape[:2]
+    P = 16
+    rng = rng if rng is not None else np.random.default_rng()
+    ph, pw = h // P, w // P
+    patch_vals = rng.uniform(0.0, 1.0, size=(ph, pw)).astype(np.float32)
+    return np.kron(patch_vals, np.ones((P, P), dtype=np.float32))
+
+
+def attr_gradcam(img_hwc, inp_norm, pred_cls, model, device, **kw) -> np.ndarray:
+    """Grad-CAM on layer4[-1] (= layer4.2.relu in ResNet-50)."""
+    if HAS_GRADCAM:
+        cam = _GradCAM(model=model, target_layers=[model.layer4[-1]])
+        gc  = cam(input_tensor=inp_norm, targets=[ClassifierOutputTarget(pred_cls)])
+        out = gc.squeeze(0).astype(np.float32)   # (224, 224)
+        h, w = img_hwc.shape[:2]
+        if out.shape != (h, w):
+            out = cv2.resize(out, (w, h), interpolation=cv2.INTER_LINEAR)
+        return out
+    # Fallback: gradient × input
+    x = inp_norm.clone().requires_grad_(True)
+    model(x)[0, pred_cls].backward()
+    return _agg_to_2d(x.grad, img_hwc.shape[:2])
+
+
+def attr_ig(img_hwc, inp_norm, pred_cls, model, device,
+            ig_steps=50, ig_trials=10, **kw) -> np.ndarray:
+    """
+    Integrated Gradients with random baselines averaged over ig_trials.
+    Matches InterpretDL: baselines='random', num_random_trials=10, steps=50.
+    """
+    if not HAS_CAPTUM:
+        raise RuntimeError("captum required for ig")
+    ig_attr  = IntegratedGradients(model)
+    hw = img_hwc.shape[:2]
+    attrs = []
+    for _ in range(ig_trials):
+        baseline = torch.randn_like(inp_norm) * 0.001  # small random noise baseline
+        attr = ig_attr.attribute(inp_norm, baselines=baseline,
+                                  target=pred_cls, n_steps=ig_steps,
+                                  internal_batch_size=1)
+        attrs.append(_agg_to_2d(attr, hw))
+    return np.mean(np.stack(attrs, axis=0), axis=0).astype(np.float32)
+
+
+def attr_sg(img_hwc, inp_norm, pred_cls, model, device,
+            sg_samples=100, sg_stdev=0.1, **kw) -> np.ndarray:
+    """
+    SmoothGrad (NoiseTunnel over Saliency).
+    Matches InterpretDL: noise_amount=0.1, n_samples=100.
+    sg_stdev=0.1 is the noise_amount fraction applied to normalised input range.
+    """
+    if not HAS_CAPTUM:
+        raise RuntimeError("captum required for sg")
+    stdev = sg_stdev * (inp_norm.max() - inp_norm.min()).item()
+    sal   = Saliency(model)
+    nt    = NoiseTunnel(sal)
+    attr  = nt.attribute(inp_norm, nt_samples=sg_samples,
+                          nt_samples_batch_size=2,
+                          stdevs=stdev, nt_type="smoothgrad_sq",
+                          target=pred_cls)
+    return _agg_to_2d(attr, img_hwc.shape[:2])
+
+
+ATTRIBUTORS = {
+    "constant":  attr_constant,
+    "random":    attr_random,
+    "random_16": attr_random_16,
+    "gradcam":   attr_gradcam,
+    "ig":        attr_ig,
+    "sg":        attr_sg,
+}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Model & dataset
+# ─────────────────────────────────────────────────────────────────────────────
 
 def load_resnet50(device):
     model = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V1)
@@ -77,360 +312,208 @@ def load_resnet50(device):
     return model
 
 
-# ── Masking baseline ─────────────────────────────────────────────────────────
-
-def get_mean_baseline(device):
-    """
-    The paper uses the channel-wise mean as the masking constant.
-    mean pixel values (after normalisation) = (0-mean)/std = -mean/std.
-    """
-    mean = torch.tensor(IMAGENET_MEAN, device=device).view(1, 3, 1, 1)
-    std  = torch.tensor(IMAGENET_STD,  device=device).view(1, 3, 1, 1)
-    # normalized value that corresponds to the original mean pixel
-    # i.e. (mean_pixel - mean) / std = 0 for each channel
-    return torch.zeros(1, 3, 1, 1, device=device)
+def load_records(data_dir: str):
+    ds = ImageFolder(data_dir)
+    return [(p, c) for p, c in ds.samples]
 
 
-# ── Attribution methods ───────────────────────────────────────────────────────
-
-def attr_constant(input_tensor, pred_class, model, device, **kw):
-    """All-zero attribution map — constant baseline."""
-    return torch.zeros(1, 224, 224, device=device)
-
-
-def attr_random(input_tensor, pred_class, model, device, **kw):
-    """Random N(0,1) attribution — random baseline."""
-    return torch.randn(1, 224, 224, device=device)
+def make_norm_transform():
+    return transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize(mean=IMAGENET_MEAN.tolist(), std=IMAGENET_STD.tolist()),
+    ])
 
 
-def _aggregate_channels(attr):
-    """Sum absolute values over colour channels → (1, H, W) cpu tensor."""
-    return attr.abs().sum(dim=1)   # (1, H, W)
+# ─────────────────────────────────────────────────────────────────────────────
+# Main evaluation loop
+# ─────────────────────────────────────────────────────────────────────────────
 
+def run_evaluation(model, records, device, args):
+    methods  = args.methods
+    n_steps  = args.n_steps
+    results  = {m: {"morf": [], "lerf": [], "abpc": []} for m in methods}
+    rng      = np.random.default_rng(args.seed)
+    total    = len(records)
+    t0       = time.time()
+    norm_tfm = make_norm_transform()
 
-def attr_ig(input_tensor, pred_class, model, device, n_steps=50, **kw):
-    """Integrated Gradients with zero baseline."""
-    ig = IntegratedGradients(model)
-    baseline = torch.zeros_like(input_tensor)
-    attrs = ig.attribute(
-        input_tensor, baselines=baseline,
-        target=pred_class, n_steps=n_steps,
-        internal_batch_size=4,
-    )
-    return _aggregate_channels(attrs.cpu())
+    for img_idx, (img_path, _) in enumerate(records):
 
-
-def attr_sg(input_tensor, pred_class, model, device, n_steps=50,
-            n_samples=50, stdev_spread=0.15, **kw):
-    """SmoothGrad (Noise Tunnel over Gradient × input)."""
-    from captum.attr import Saliency
-    sal = Saliency(model)
-    nt  = NoiseTunnel(sal)
-    # stdev = spread × (max - min) of input  ≈ paper default
-    stdev = stdev_spread * (input_tensor.max() - input_tensor.min()).item()
-    attrs = nt.attribute(
-        input_tensor,
-        n_samples=n_samples,
-        stdevs=stdev,
-        nt_type='smoothgrad_sq',
-        target=pred_class,
-    )
-    return _aggregate_channels(attrs.cpu())
-
-
-def attr_gradcam(input_tensor, pred_class, model, device, **kw):
-    """
-    Grad-CAM on ResNet-50 layer4.
-    Uses pytorch-grad-cam if installed; otherwise falls back to
-    gradient × input aggregated spatially.
-    """
-    if HAS_GRADCAM:
-        target_layer = [model.layer4[-1]]
-        cam = PytorchGradCAM(model=model, target_layers=target_layer)
-        targets = [ClassifierOutputTarget(pred_class)]
-        grayscale_cam = cam(input_tensor=input_tensor, targets=targets)
-        # shape (1, H, W); already [0,1]
-        return torch.from_numpy(grayscale_cam)
-
-    # Fallback: gradient magnitude
-    inp = input_tensor.clone().requires_grad_(True)
-    out = model(inp)
-    score = out[0, pred_class]
-    score.backward()
-    grad = inp.grad.abs()
-    return _aggregate_channels(grad.cpu())
-
-
-ATTRIBUTORS = {
-    "constant": attr_constant,
-    "random":   attr_random,
-    "ig":       attr_ig,
-    "sg":       attr_sg,
-    "gradcam":  attr_gradcam,
-}
-
-
-# ── Patch masking ─────────────────────────────────────────────────────────────
-
-def build_patch_ranking(attr_map: torch.Tensor, patch_size: int):
-    """
-    attr_map : (1, 224, 224) float tensor — higher = more important.
-    Returns list of (row, col) patch indices sorted descending by importance.
-    """
-    H = W = 224
-    gh = H // patch_size
-    gw = W // patch_size
-    patches = []
-    arr = attr_map.squeeze(0).cpu().numpy()   # (224, 224)
-    for pr in range(gh):
-        for pc in range(gw):
-            r0, r1 = pr * patch_size, (pr + 1) * patch_size
-            c0, c1 = pc * patch_size, (pc + 1) * patch_size
-            val = arr[r0:r1, c0:c1].mean()
-            patches.append((val, pr, pc))
-    patches.sort(key=lambda x: x[0], reverse=True)  # descending
-    return patches  # MoRF order
-
-
-def apply_mask(input_tensor, patches_to_mask, patch_size, mask_value=0.0):
-    """Return a copy of input_tensor with specified patches replaced."""
-    out = input_tensor.clone()
-    for _, pr, pc in patches_to_mask:
-        r0, r1 = pr * patch_size, (pr + 1) * patch_size
-        c0, c1 = pc * patch_size, (pc + 1) * patch_size
-        out[0, :, r0:r1, c0:c1] = mask_value
-    return out
-
-
-# ── MoRF / LeRF curves ───────────────────────────────────────────────────────
-
-PERCENTAGES = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
-
-@torch.no_grad()
-def evaluate_curve(
-    model, input_tensor, pred_class, ranked_patches,
-    patch_size, device, reverse=False
-):
-    """
-    Compute perturbation curve.
-    reverse=False → MoRF  (mask top-ranked first)
-    reverse=True  → LeRF  (mask bottom-ranked first)
-    Returns list of probabilities at each percentage step.
-    """
-    total = len(ranked_patches)
-    # Original unmasked probability
-    orig_logits = model(input_tensor)
-    orig_prob = F.softmax(orig_logits, dim=1)[0, pred_class].item()
-
-    curve = [orig_prob]
-    order = list(reversed(ranked_patches)) if reverse else ranked_patches
-
-    for p in PERCENTAGES[1:]:
-        n = int(p * total)
-        masked = apply_mask(input_tensor, order[:n], patch_size)
-        masked = masked.to(device)
-        logits = model(masked)
-        prob = F.softmax(logits, dim=1)[0, pred_class].item()
-        curve.append(prob)
-
-    return curve
-
-
-def auc_curve(curve):
-    """Trapezoid AUC of the perturbation curve over [0, 1]."""
-    return float(np.trapezoid(curve, PERCENTAGES))
-
-
-# ── Main evaluation loop ──────────────────────────────────────────────────────
-
-def load_images_with_labels(data_dir, label_file, num_samples, preprocess, device):
-    """
-    Loads images from data_dir.
-    If label_file is provided, reads ground-truth labels (1-indexed).
-    If label_file is None (test set), no ground-truth labels — uses top-1 pred.
-
-    Returns list of (input_tensor, true_label_or_None, image_path).
-    """
-    import glob
-    paths = sorted(glob.glob(os.path.join(data_dir, "*.JPEG")))
-    if not paths:
-        paths = sorted(glob.glob(os.path.join(data_dir, "**/*.JPEG"), recursive=True))
-    if not paths:
-        raise FileNotFoundError(f"No JPEG images in {data_dir}")
-
-    labels_map = {}
-    if label_file and os.path.isfile(label_file):
-        with open(label_file) as f:
-            for i, line in enumerate(f, start=1):
-                labels_map[i] = int(line.strip()) - 1  # 0-indexed
-
-    # Limit sample count
-    if num_samples and num_samples < len(paths):
-        rng = random.Random(42)
-        paths = rng.sample(paths, num_samples)
-        paths.sort()
-
-    records = []
-    for p in paths:
+        # ── 1. Load uint8 image (matches InterpretDL read_image) ─────────────
         try:
-            img = Image.open(p).convert("RGB")
-            tensor = preprocess(img).unsqueeze(0).to(device)
+            img_hwc = read_image_uint8(img_path, resize_to=args.resize_to, crop_to=args.crop_to)
         except Exception as e:
-            print(f"[skip] {p}: {e}")
+            print(f"[skip] {img_path}: {e}")
             continue
-        # Derive 1-based index from filename if possible
-        basename = os.path.basename(p)
-        idx = None
-        try:
-            # e.g. ILSVRC2012_val_00000001.JPEG or ILSVRC2012_test_00000001.JPEG
-            idx = int(basename.split("_")[-1].split(".")[0])
-        except Exception:
-            pass
-        gt = labels_map.get(idx, None)
-        records.append((tensor, gt, p))
 
-    return records
+        img_nhwc = img_hwc[np.newaxis]  # (1, H, W, 3)
 
+        # ── 2. Normalised tensor for gradient-based methods ──────────────────
+        inp_norm = norm_tfm(Image.fromarray(img_hwc)).unsqueeze(0).to(device)  # (1,3,H,W)
 
-def run_evaluation(
-    model, records, device, patch_size, n_steps, n_sg_samples,
-    methods=None, verbose=True,
-):
-    if methods is None:
-        methods = list(ATTRIBUTORS.keys())
-
-    # results[method] = {"morf_auc": [], "lerf_auc": []}
-    results = {m: {"morf_auc": [], "lerf_auc": []} for m in methods}
-
-    for idx, (input_tensor, gt_label, path) in enumerate(records):
-        # Determine prediction class
+        # ── 3. Predicted class (from original normalised image) ──────────────
         with torch.no_grad():
-            logits = model(input_tensor)
-            pred_class = int(torch.argmax(logits, dim=1).item())
+            pred_cls = int(torch.argmax(model(inp_norm), dim=1).item())
 
-        if verbose and (idx + 1) % 20 == 0:
-            print(f"  [{idx+1}/{len(records)}] pred={pred_class}", flush=True)
-
+        # ── 4. Per-method ────────────────────────────────────────────────────
         for method in methods:
             attr_fn = ATTRIBUTORS[method]
             try:
                 attr_map = attr_fn(
-                    input_tensor=input_tensor,
-                    pred_class=pred_class,
-                    model=model,
-                    device=device,
-                    n_steps=n_steps,
-                    n_samples=n_sg_samples,
+                    img_hwc=img_hwc, inp_norm=inp_norm,
+                    pred_cls=pred_cls, model=model, device=device,
+                    rng=rng,
+                    ig_steps=args.ig_steps, ig_trials=args.ig_trials,
+                    sg_samples=args.sg_samples, sg_stdev=args.sg_stdev,
                 )
             except Exception as e:
-                print(f"[warn] {method} attribution failed on {os.path.basename(path)}: {e}")
+                print(f"  [warn] {method} attr failed on {img_path}: {e}")
                 continue
+
+            # Resize attr_map to match image spatial dims if needed
+            h, w = img_hwc.shape[:2]
+            if attr_map.shape != (h, w):
+                attr_map = cv2.resize(attr_map, (w, h), interpolation=cv2.INTER_LINEAR)
 
             torch.cuda.empty_cache()
 
-            ranked = build_patch_ranking(attr_map, patch_size)
+            # ── 5. Generate MoRF/LeRF perturbed image stacks ─────────────────
+            morf_nhwc, lerf_nhwc = generate_morf_lerf_images(img_nhwc, attr_map, n_steps)
 
-            morf_curve = evaluate_curve(
-                model, input_tensor, pred_class, ranked,
-                patch_size, device, reverse=False
-            )
-            lerf_curve = evaluate_curve(
-                model, input_tensor, pred_class, ranked,
-                patch_size, device, reverse=True
-            )
+            # ── 6. Run model on all stacks ────────────────────────────────────
+            morf_probs_nc = run_model_on_batch(model, morf_nhwc, device)  # (K+1, C)
+            lerf_probs_nc = run_model_on_batch(model, lerf_nhwc, device)
 
-            results[method]["morf_auc"].append(auc_curve(morf_curve))
-            results[method]["lerf_auc"].append(auc_curve(lerf_curve))
+            morf_probas = morf_probs_nc[:, pred_cls]  # (K+1,)
+            lerf_probas = lerf_probs_nc[:, pred_cls]
 
-        # Clear gradients
-        torch.cuda.empty_cache()
+            # ── 7. Scores (from medical_image_example.ipynb — exact formula) ──
+            # MoRF = mean drop: mean(probas[0] - MoRF_probas)
+            # Note: probas[0] = original (unmasked) probability
+            morf_score = float((morf_probas[0] - morf_probas).mean())
+            lerf_score = float((lerf_probas[0] - lerf_probas).mean())
+            # ABPC = mean(LeRF_probas - MoRF_probas)
+            abpc_score = float((lerf_probas - morf_probas).mean())
+
+            results[method]["morf"].append(morf_score)
+            results[method]["lerf"].append(lerf_score)
+            results[method]["abpc"].append(abpc_score)
+
+            torch.cuda.empty_cache()
+
+        # ── Progress ─────────────────────────────────────────────────────────
+        if (img_idx + 1) % 100 == 0 or (img_idx + 1) == total:
+            elapsed = time.time() - t0
+            rate    = (img_idx + 1) / elapsed
+            eta     = (total - img_idx - 1) / rate if rate > 0 else 0
+            print(f"  [{img_idx+1}/{total}]  elapsed={elapsed/60:.1f}m  ETA={eta/60:.1f}m", flush=True)
 
     return results
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Reporting
+# ─────────────────────────────────────────────────────────────────────────────
+
+PAPER_TABLE1 = {
+    # NeurIPS 2023 Table 1, ResNet-50 — MoRF↑ ABPC↑
+    "constant":  (0.000, 0.000),
+    "random_16": (0.596, 0.007),
+    "random":    (0.599, 0.008),
+    "gradcam":   (0.628, 0.424),
+    "ig":        (0.709, 0.377),
+    "sg":        (0.701, 0.369),
+}
+
+
 def summarise(results):
-    summary = {}
+    out = {}
     for method, data in results.items():
-        morf_vals = data["morf_auc"]
-        lerf_vals = data["lerf_auc"]
-        if not morf_vals:
+        n = len(data["morf"])
+        if n == 0:
             continue
-        morf = float(np.mean(morf_vals))
-        lerf = float(np.mean(lerf_vals))
-        abpc = morf - lerf
-        summary[method] = {"MoRF": morf, "LeRF": lerf, "ABPC": abpc}
-    return summary
+        out[method] = {
+            "MoRF":  float(np.mean(data["morf"])),
+            "LeRF":  float(np.mean(data["lerf"])),
+            "ABPC":  float(np.mean(data["abpc"])),
+            "n":     n,
+        }
+    return out
 
 
 def print_table(summary):
-    header = f"{'Method':<12}  {'MoRF':>8}  {'LeRF':>8}  {'ABPC':>8}"
+    col = 8
+    hdr = f"{'Method':<14}  {'MoRF↑':>{col}}  {'LeRF':>{col}}  {'ABPC↑':>{col}}  {'N':>6}"
+    sep = "=" * len(hdr)
     print()
-    print("=" * len(header))
-    print(header)
-    print("-" * len(header))
-    for method, vals in summary.items():
-        print(f"{method:<12}  {vals['MoRF']:>8.4f}  {vals['LeRF']:>8.4f}  {vals['ABPC']:>8.4f}")
-    print("=" * len(header))
+    print(sep)
+    print("  REPRODUCED (ResNet-50)")
+    print(sep)
+    print(hdr)
+    print("-" * len(hdr))
+    for method, v in summary.items():
+        print(f"{method:<14}  {v['MoRF']:>{col}.4f}  {v['LeRF']:>{col}.4f}"
+              f"  {v['ABPC']:>{col}.4f}  {v['n']:>6}")
+    print(sep)
+
     print()
-    # Paper Table 1 reference values (ResNet-50, from paper):
-    print("Paper Table 1 reference (ResNet-50):")
-    paper = {
-        "constant": (None, None, None),
-        "random":   (0.597, None, 0.007),
-        "gradcam":  (0.628, None, 0.371),
-        "ig":       (0.623, None, 0.418),
-        "sg":       (None,  None, None),
-    }
-    for m, (morf, lerf, abpc) in paper.items():
-        vals = []
-        for v in [morf, lerf, abpc]:
-            vals.append(f"{v:>8.3f}" if v is not None else f"{'N/A':>8}")
-        print(f"  {m:<12} MoRF={vals[0]}  LeRF={vals[1]}  ABPC={vals[2]}")
+    print(sep)
+    print("  PAPER TABLE 1 (ResNet-50, NeurIPS 2023)")
+    print(sep)
+    ph = f"{'Method':<14}  {'MoRF↑':>{col}}  {'ABPC↑':>{col}}"
+    print(ph)
+    print("-" * len(ph))
+    for m, (morf, abpc) in PAPER_TABLE1.items():
+        print(f"{m:<14}  {morf:>{col}.3f}  {abpc:>{col}.3f}")
+    print(sep)
     print()
 
 
-def save_csv(summary, output_csv, num_samples, patch_size, n_steps):
-    with open(output_csv, "w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(["method", "MoRF", "LeRF", "ABPC",
-                         "num_samples", "patch_size", "n_steps"])
-        for method, vals in summary.items():
-            writer.writerow([
-                method,
-                f"{vals['MoRF']:.6f}",
-                f"{vals['LeRF']:.6f}",
-                f"{vals['ABPC']:.6f}",
-                num_samples, patch_size, n_steps,
-            ])
-    print(f"Saved → {output_csv}")
+def save_results(summary, output_dir: str, args):
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+    csv_path = os.path.join(output_dir, "table1_resnet50.csv")
+    with open(csv_path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["method", "MoRF", "LeRF", "ABPC", "N",
+                    "n_steps", "ig_steps", "ig_trials",
+                    "sg_samples", "sg_stdev", "seed"])
+        for method, v in summary.items():
+            w.writerow([method,
+                        f"{v['MoRF']:.6f}", f"{v['LeRF']:.6f}", f"{v['ABPC']:.6f}",
+                        v["n"], args.n_steps, args.ig_steps, args.ig_trials,
+                        args.sg_samples, args.sg_stdev, args.seed])
+    print(f"Results saved → {csv_path}")
 
 
-# ── CLI ───────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# CLI
+# ─────────────────────────────────────────────────────────────────────────────
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="Table 1 replication: ResNet-50, MoRF + LeRF + ABPC"
+        description="M4 Table 1 replication — ResNet-50 (exact InterpretDL formula)"
     )
-    p.add_argument("--data_dir",   default="data",
-                   help="Directory containing ImageNet JPEG images")
-    p.add_argument("--label_file", default=None,
-                   help="Path to ILSVRC2012_validation_ground_truth.txt "
-                        "(1 label per line, 1-indexed). Omit for test set.")
-    p.add_argument("--num_samples", type=int, default=100,
-                   help="Number of images to evaluate (default: 100)")
-    p.add_argument("--patch_size",  type=int, default=16,
-                   help="Patch size for masking (default: 16 → 14×14 grid)")
-    p.add_argument("--n_steps",     type=int, default=50,
-                   help="IG integration steps (default: 50)")
-    p.add_argument("--n_sg_samples",type=int, default=50,
-                   help="SmoothGrad noise samples (default: 50)")
+    p.add_argument("--data_dir",    default="data/M4_5000",
+                   help="ImageFolder-style directory (synset subdirs)")
     p.add_argument("--methods",     nargs="+",
                    default=["constant", "random", "gradcam", "ig", "sg"],
-                   choices=list(ATTRIBUTORS.keys()),
-                   help="Attribution methods to evaluate")
-    p.add_argument("--output_csv",  default="results_table1.csv",
-                   help="Output CSV path")
-    p.add_argument("--seed", type=int, default=42)
+                   choices=list(ATTRIBUTORS.keys()))
+    p.add_argument("--n_steps",     type=int, default=N_STEPS,
+                   help="Perturbation steps (paper: 20)")
+    p.add_argument("--resize_to",   type=int, default=224)
+    p.add_argument("--crop_to",     type=int, default=224)
+    p.add_argument("--ig_steps",    type=int, default=50,
+                   help="IG integration steps (paper: 50)")
+    p.add_argument("--ig_trials",   type=int, default=10,
+                   help="IG random baseline trials (paper: 10)")
+    p.add_argument("--sg_samples",  type=int, default=100,
+                   help="SmoothGrad noise samples (paper: 100)")
+    p.add_argument("--sg_stdev",    type=float, default=0.1,
+                   help="SmoothGrad noise_amount fraction (paper: 0.1)")
+    p.add_argument("--output_dir",  default="results/table1_faithful")
+    p.add_argument("--seed",        type=int, default=42)
+    p.add_argument("--limit",       type=int, default=None,
+                   help="Limit number of images (for quick testing)")
     return p.parse_args()
 
 
@@ -442,42 +525,30 @@ def main():
     random.seed(args.seed)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Device: {device}")
-    print(f"Methods: {args.methods}")
-    print(f"Patch size: {args.patch_size}  n_steps: {args.n_steps}  "
-          f"n_sg_samples: {args.n_sg_samples}")
+    print(f"Device     : {device}")
+    print(f"Methods    : {args.methods}")
+    print(f"n_steps    : {args.n_steps}")
+    print(f"ig_steps   : {args.ig_steps}  ig_trials: {args.ig_trials}")
+    print(f"sg_samples : {args.sg_samples}  sg_stdev: {args.sg_stdev}")
 
-    print("Loading ResNet-50 (ImageNet-1K weights)...")
     model = load_resnet50(device)
+    print("ResNet-50 (IMAGENET1K_V1) loaded.")
 
-    preprocess = build_preprocess()
+    records = load_records(args.data_dir)
+    print(f"Dataset    : {len(records)} images from {args.data_dir}")
 
-    print(f"Loading images from: {args.data_dir}")
-    records = load_images_with_labels(
-        args.data_dir, args.label_file,
-        args.num_samples, preprocess, device
-    )
-    print(f"Loaded {len(records)} images.")
+    if args.limit:
+        rng_s = random.Random(args.seed)
+        rng_s.shuffle(records)
+        records = records[:args.limit]
+        print(f"           (limited to {len(records)} images)")
 
-    if not records:
-        print("No images loaded. Exiting.")
-        sys.exit(1)
-
-    print(f"\nRunning evaluation...")
-    results = run_evaluation(
-        model, records, device,
-        patch_size=args.patch_size,
-        n_steps=args.n_steps,
-        n_sg_samples=args.n_sg_samples,
-        methods=args.methods,
-    )
+    print("\nEvaluating …")
+    results = run_evaluation(model, records, device, args)
 
     summary = summarise(results)
     print_table(summary)
-    save_csv(summary, args.output_csv,
-             num_samples=len(records),
-             patch_size=args.patch_size,
-             n_steps=args.n_steps)
+    save_results(summary, args.output_dir, args)
 
 
 if __name__ == "__main__":
