@@ -416,13 +416,13 @@ def run_evaluation(model, records, device, args):
 # ─────────────────────────────────────────────────────────────────────────────
 
 PAPER_TABLE1 = {
-    # NeurIPS 2023 Table 1, ResNet-50 — MoRF↑ ABPC↑
-    "constant":  (0.000, 0.000),
-    "random_16": (0.596, 0.007),
-    "random":    (0.599, 0.008),
-    "gradcam":   (0.628, 0.424),
-    "ig":        (0.709, 0.377),
-    "sg":        (0.701, 0.369),
+    # NeurIPS 2023 Table 1, ResNet-50 — (MoRF↑, ABPC↑, PScore↑, INFD↓, SynScore↑)
+    "Constant":  (0.000, 0.000, None,  3.015, 0.072),
+    "Random-16": (0.596, 0.007, None,  3.039, 0.077),
+    "Random":    (0.599, 0.008, None,  3.015, 0.078),
+    "GradCAM":   (0.628, 0.424, 0.835, 2.496, 1.000),
+    "IG":        (0.709, 0.377, 0.812, 2.373, 0.999),
+    "SG":        (0.701, 0.369, 0.820, 2.323, 0.998),
 }
 
 
@@ -433,18 +433,27 @@ def summarise(results):
         if n == 0:
             continue
         out[method] = {
-            "MoRF":  float(np.mean(data["morf"])),
-            "LeRF":  float(np.mean(data["lerf"])),
-            "ABPC":  float(np.mean(data["abpc"])),
-            "n":     n,
+            "MoRF":     float(np.mean(data["morf"])),
+            "LeRF":     float(np.mean(data["lerf"])),
+            "ABPC":     float(np.mean(data["abpc"])),
+            "PScore":   float(np.mean(data["pscore"]))   if data.get("pscore")   else None,
+            "INFD":     float(np.mean(data["infd"]))     if data.get("infd")     else None,
+            "SynScore": float(np.mean(data["synscore"])) if data.get("synscore") else None,
+            "n":        n,
         }
     return out
 
 
 def print_table(summary):
-    col = 8
-    hdr = f"{'Method':<14}  {'MoRF↑':>{col}}  {'LeRF':>{col}}  {'ABPC↑':>{col}}  {'N':>6}"
+    mc, ac, pc, ic, sc = 9, 9, 10, 9, 12
+
+    def _fmt(v, w, d=3):
+        return f"{v:>{w}.{d}f}" if v is not None else f"{'N/A':>{w}}"
+
+    hdr = (f"{'Method':<16}  {'MoRF(^)':>{mc}}  {'ABPC(^)':>{ac}}"
+           f"  {'PScore(^)':>{pc}}  {'INFD(v)':>{ic}}  {'SynScore(^)':>{sc}}  {'N':>6}")
     sep = "=" * len(hdr)
+
     print()
     print(sep)
     print("  REPRODUCED (ResNet-50)")
@@ -452,19 +461,22 @@ def print_table(summary):
     print(hdr)
     print("-" * len(hdr))
     for method, v in summary.items():
-        print(f"{method:<14}  {v['MoRF']:>{col}.4f}  {v['LeRF']:>{col}.4f}"
-              f"  {v['ABPC']:>{col}.4f}  {v['n']:>6}")
+        print(f"{method:<16}  {_fmt(v['MoRF'], mc)}  {_fmt(v['ABPC'], ac)}"
+              f"  {_fmt(v['PScore'], pc)}  {_fmt(v['INFD'], ic)}  {_fmt(v['SynScore'], sc)}"
+              f"  {v['n']:>6}")
     print(sep)
 
+    ph = (f"{'AttributionMethods':<20}  {'MoRF(^)':>{mc}}  {'ABPC(^)':>{ac}}"
+          f"  {'PScore(^)':>{pc}}  {'INFD(v)':>{ic}}  {'SynScore(^)':>{sc}}")
     print()
     print(sep)
     print("  PAPER TABLE 1 (ResNet-50, NeurIPS 2023)")
     print(sep)
-    ph = f"{'Method':<14}  {'MoRF↑':>{col}}  {'ABPC↑':>{col}}"
     print(ph)
     print("-" * len(ph))
-    for m, (morf, abpc) in PAPER_TABLE1.items():
-        print(f"{m:<14}  {morf:>{col}.3f}  {abpc:>{col}.3f}")
+    for m, (morf, abpc, pscore, infd, synscore) in PAPER_TABLE1.items():
+        print(f"{m:<20}  {_fmt(morf, mc)}  {_fmt(abpc, ac)}"
+              f"  {_fmt(pscore, pc)}  {_fmt(infd, ic)}  {_fmt(synscore, sc)}")
     print(sep)
     print()
 
@@ -472,17 +484,29 @@ def print_table(summary):
 def save_results(summary, output_dir: str, args):
     Path(output_dir).mkdir(parents=True, exist_ok=True)
     csv_path = os.path.join(output_dir, "table1_resnet50.csv")
+
+    def _csv_val(v):
+        return f"{v:.3f}" if v is not None else ""
+
     with open(csv_path, "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["method", "MoRF", "LeRF", "ABPC", "N",
-                    "n_steps", "ig_steps", "ig_trials",
-                    "sg_samples", "sg_stdev", "seed"])
+        w.writerow(["method", "MoRF", "LeRF", "ABPC", "PScore", "INFD", "SynScore",
+                    "N", "n_steps", "ig_steps", "ig_trials", "sg_samples", "sg_stdev", "seed"])
         for method, v in summary.items():
-            w.writerow([method,
-                        f"{v['MoRF']:.6f}", f"{v['LeRF']:.6f}", f"{v['ABPC']:.6f}",
-                        v["n"], args.n_steps, args.ig_steps, args.ig_trials,
-                        args.sg_samples, args.sg_stdev, args.seed])
+            w.writerow([
+                method,
+                _csv_val(v["MoRF"]),
+                _csv_val(v["LeRF"]),
+                _csv_val(v["ABPC"]),
+                _csv_val(v["PScore"]),
+                _csv_val(v["INFD"]),
+                _csv_val(v["SynScore"]),
+                v["n"],
+                args.n_steps, args.ig_steps, args.ig_trials,
+                args.sg_samples, args.sg_stdev, args.seed,
+            ])
     print(f"Results saved → {csv_path}")
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────
